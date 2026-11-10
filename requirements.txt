@@ -1,0 +1,8 @@
+
+streamlit
+ultralytics
+Pillow
+numpy
+streamlit-cropper
+streamlit-image-coordinates
+openvino
