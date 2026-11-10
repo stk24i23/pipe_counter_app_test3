@@ -1,48 +1,136 @@
 
-import os
-import io
-import csv
-import zipfile
-import hashlib
-from pathlib import Path
-from datetime import datetime
-
 import streamlit as st
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw
 from ultralytics import YOLO
-from streamlit_cropper import st_cropper
 from streamlit_image_coordinates import streamlit_image_coordinates
-
+from streamlit_cropper import st_cropper
+import numpy as np
+import io
+import zipfile
+import csv
+import hashlib
+from datetime import datetime
 
 st.set_page_config(
     page_title="PINEAPPLE",
     page_icon="🍍",
-    layout="wide"
+    layout="centered",
+    initial_sidebar_state="collapsed"
 )
 
+st.markdown("""
+<style>
+    .block-container {
+        max-width: 900px;
+        padding-top: 0.8rem;
+        padding-bottom: 1rem;
+        padding-left: 0.8rem;
+        padding-right: 0.8rem;
+    }
+    h1 {
+        text-align: center;
+        font-size: 1.8rem !important;
+        margin-bottom: 0.2rem;
+    }
+    h2, h3 {
+        font-size: 1.15rem !important;
+    }
+    div.stButton > button,
+    div.stDownloadButton > button {
+        width: 100%;
+        min-height: 44px;
+        border-radius: 10px;
+        font-weight: 600;
+    }
+    div[data-testid="stMetric"] {
+        background: rgba(128,128,128,0.08);
+        padding: 10px;
+        border-radius: 10px;
+    }
+    div[data-testid="stMetricValue"] {
+        font-size: 1.6rem;
+    }
+    [data-testid="stFileUploader"] {
+        padding: 0;
+    }
+    .stRadio > div {
+        gap: 0.5rem;
+    }
+    footer {
+        visibility: hidden;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-MODEL_CANDIDATES = [
-    "last_openvino_model",
-    "best_openvino_model",
-    "best.pt"
-]
 
-MAX_IMAGE_SIZE = 1280
-MAX_DISPLAY_WIDTH = 1000
+@st.cache_resource
+def load_model():
+    return YOLO("last_openvino_model")
+
+
+model = load_model()
+
+TARGET_SIZE = 960
+CONFIDENCE = 0.5
+MAX_DETECTIONS = 2000
+
+
+def resize_image(img, max_size=TARGET_SIZE):
+    w, h = img.size
+    scale = min(max_size / max(w, h), 1.0)
+    if scale < 1.0:
+        return img.resize(
+            (int(w * scale), int(h * scale)),
+            Image.Resampling.LANCZOS
+        )
+    return img.copy()
+
+
+def draw_result_image(base_image):
+    result = base_image.copy()
+    draw = ImageDraw.Draw(result)
+
+    for box in st.session_state.auto_boxes:
+        x1, y1, x2, y2 = box
+        cx = int((x1 + x2) / 2)
+        cy = int((y1 + y2) / 2)
+        r = 9
+        draw.ellipse(
+            (cx-r-1, cy-r-1, cx+r+1, cy+r+1),
+            fill="black"
+        )
+        draw.ellipse(
+            (cx-r, cy-r, cx+r, cy+r),
+            fill="#FFD700"
+        )
+
+    for px, py in st.session_state.manual_points:
+        r = 9
+        draw.ellipse(
+            (px-r-1, py-r-1, px+r+1, py+r+1),
+            fill="white"
+        )
+        draw.ellipse(
+            (px-r, py-r, px+r, py+r),
+            fill="#00A8FF"
+        )
+
+    return result
 
 
 def initialize_state():
     defaults = {
+        "phase": "upload",
         "source_hash": None,
-        "source_image": None,
-        "work_image": None,
-        "markers": [],
-        "automatic_count": 0,
-        "manual_added": 0,
-        "manual_deleted": 0,
-        "detected": False,
-        "click_version": 0,
-        "saved_records": []
+        "original_image": None,
+        "cropped_image": None,
+        "auto_boxes": [],
+        "manual_points": [],
+        "deleted_auto_count": 0,
+        "last_click": None,
+        "group_name": "A",
+        "comment": "",
+        "result_timestamp": None
     }
 
     for key, value in defaults.items():
@@ -50,530 +138,309 @@ def initialize_state():
             st.session_state[key] = value
 
 
-initialize_state()
+def reset_detection():
+    st.session_state.auto_boxes = []
+    st.session_state.manual_points = []
+    st.session_state.deleted_auto_count = 0
+    st.session_state.last_click = None
+    st.session_state.result_timestamp = None
 
 
-def find_model_path():
-    configured_path = os.getenv("MODEL_PATH")
+def start_detection(image):
+    inference_image = resize_image(image)
 
-    if configured_path:
-        return Path(configured_path)
-
-    for candidate in MODEL_CANDIDATES:
-        path = Path(candidate)
-
-        if path.exists():
-            return path
-
-    return None
-
-
-def resize_image(image, max_size=MAX_IMAGE_SIZE):
-    image = image.convert("RGB")
-
-    image.thumbnail(
-        (max_size, max_size),
-        Image.Resampling.LANCZOS
-    )
-
-    return image
-
-
-@st.cache_resource
-def load_model(model_path):
-    return YOLO(str(model_path), task="detect")
-
-
-def image_to_png_bytes(image):
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return buffer.getvalue()
-
-
-def draw_markers(image, markers):
-    result = image.copy()
-    draw = ImageDraw.Draw(result)
-
-    width, height = result.size
-
-    radius = max(5, int(width / 150))
-    outline_width = max(2, int(width / 400))
-
-    for marker in markers:
-        x = int(marker["x"])
-        y = int(marker["y"])
-
-        draw.ellipse(
-            (
-                x - radius,
-                y - radius,
-                x + radius,
-                y + radius
-            ),
-            fill=None,
-            outline="#FFFF00",
-            width=outline_width
+    with st.spinner("AIがパイプを検出しています..."):
+        results = model.predict(
+            inference_image,
+            conf=CONFIDENCE,
+            max_det=MAX_DETECTIONS,
+            verbose=False
         )
 
-    return result
+    boxes = []
 
+    for box in results[0].boxes:
+        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().tolist()
+        boxes.append([int(x1), int(y1), int(x2), int(y2)])
 
-def run_detection(image, model, confidence):
-    results = model.predict(
-        source=image,
-        conf=confidence,
-        imgsz=640,
-        verbose=False
+    st.session_state.cropped_image = inference_image
+    st.session_state.auto_boxes = boxes
+    st.session_state.manual_points = []
+    st.session_state.deleted_auto_count = 0
+    st.session_state.last_click = None
+    st.session_state.result_timestamp = datetime.now().strftime(
+        "%Y%m%d_%H%M%S"
     )
-
-    markers = []
-
-    for result in results:
-        if result.boxes is None:
-            continue
-
-        boxes = result.boxes.xyxy.cpu().numpy()
-
-        for box in boxes:
-            x1, y1, x2, y2 = box
-
-            center_x = (x1 + x2) / 2
-            center_y = (y1 + y2) / 2
-
-            markers.append({
-                "x": float(center_x),
-                "y": float(center_y),
-                "kind": "auto"
-            })
-
-    return markers
+    st.session_state.phase = "result"
 
 
-def reset_detection():
-    st.session_state.markers = []
-    st.session_state.automatic_count = 0
-    st.session_state.manual_added = 0
-    st.session_state.manual_deleted = 0
-    st.session_state.detected = False
-    st.session_state.click_version += 1
+def remove_nearest_point(x, y, threshold=30):
+    nearest_index = None
+    nearest_distance = threshold
 
+    for i, box in enumerate(st.session_state.auto_boxes):
+        cx = (box[0] + box[2]) / 2
+        cy = (box[1] + box[3]) / 2
+        distance = ((x - cx) ** 2 + (y - cy) ** 2) ** 0.5
 
-def handle_image_click(coords, display_width, display_height):
-    if coords is None:
+        if distance < nearest_distance:
+            nearest_distance = distance
+            nearest_index = i
+
+    if nearest_index is not None:
+        st.session_state.auto_boxes.pop(nearest_index)
+        st.session_state.deleted_auto_count += 1
         return
 
-    if not st.session_state.detected:
-        return
+    nearest_index = None
+    nearest_distance = threshold
 
-    original_image = st.session_state.work_image
+    for i, point in enumerate(st.session_state.manual_points):
+        distance = ((x - point[0]) ** 2 + (y - point[1]) ** 2) ** 0.5
 
-    original_width, original_height = original_image.size
+        if distance < nearest_distance:
+            nearest_distance = distance
+            nearest_index = i
 
-    x = coords["x"] * original_width / display_width
-    y = coords["y"] * original_height / display_height
-
-    mode = st.session_state.edit_mode
-
-    if mode == "追加":
-        st.session_state.markers.append({
-            "x": x,
-            "y": y,
-            "kind": "manual"
-        })
-
-        st.session_state.manual_added += 1
-
-    elif mode == "削除":
-        if not st.session_state.markers:
-            return
-
-        nearest_index = None
-        nearest_distance = float("inf")
-
-        delete_range = max(25, original_width * 0.025)
-
-        for index, marker in enumerate(st.session_state.markers):
-            dx = marker["x"] - x
-            dy = marker["y"] - y
-
-            distance = (dx ** 2 + dy ** 2) ** 0.5
-
-            if distance < nearest_distance:
-                nearest_distance = distance
-                nearest_index = index
-
-        if nearest_index is not None and nearest_distance <= delete_range:
-            st.session_state.markers.pop(nearest_index)
-            st.session_state.manual_deleted += 1
+    if nearest_index is not None:
+        st.session_state.manual_points.pop(nearest_index)
 
 
-def create_csv_bytes(records):
-    buffer = io.StringIO(newline="")
+def create_zip():
+    timestamp = st.session_state.result_timestamp
+    result_image = draw_result_image(st.session_state.cropped_image)
 
-    fieldnames = [
-        "日時",
-        "グループ",
-        "自動検出本数",
-        "手動追加本数",
-        "手動削減本数",
-        "合計本数",
-        "コメント"
-    ]
-
-    writer = csv.DictWriter(
-        buffer,
-        fieldnames=fieldnames
+    total = (
+        len(st.session_state.auto_boxes)
+        + len(st.session_state.manual_points)
     )
 
-    writer.writeheader()
-
-    for record in records:
-        writer.writerow(record["data"])
-
-    return buffer.getvalue().encode("utf-8-sig")
-
-
-def create_zip_bytes(records):
-    buffer = io.BytesIO()
+    zip_buffer = io.BytesIO()
 
     with zipfile.ZipFile(
-        buffer,
+        zip_buffer,
         "w",
         compression=zipfile.ZIP_DEFLATED
     ) as archive:
 
-        csv_data = create_csv_bytes(records)
+        image_buffer = io.BytesIO()
+        result_image.save(image_buffer, format="PNG")
 
         archive.writestr(
-            "pipe_count.csv",
-            csv_data
+            f"result_{timestamp}.png",
+            image_buffer.getvalue()
         )
 
-        for index, record in enumerate(records, start=1):
-            filename = f"results/result_{index:03d}.png"
+        csv_buffer = io.StringIO()
+        writer = csv.writer(csv_buffer)
 
-            archive.writestr(
-                filename,
-                record["image"]
-            )
+        writer.writerow([
+            "日時",
+            "グループ",
+            "AI検出数",
+            "手動追加数",
+            "手動削減数",
+            "最終合計",
+            "備考"
+        ])
 
-    return buffer.getvalue()
+        writer.writerow([
+            timestamp,
+            st.session_state.group_name,
+            len(st.session_state.auto_boxes),
+            len(st.session_state.manual_points),
+            st.session_state.deleted_auto_count,
+            total,
+            st.session_state.comment
+        ])
+
+        archive.writestr(
+            f"result_{timestamp}.csv",
+            csv_buffer.getvalue().encode("utf-8-sig")
+        )
+
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
 
 
-st.title("🍍 PINEAPPLE")
-st.caption("AIによるパイプ本数カウントアプリケーション")
+initialize_state()
 
-st.divider()
+st.title("PINEAPPLE 🍍")
 
+if st.session_state.phase == "upload":
 
-st.header("1. 画像の取り込み")
+    st.caption("AIによるパイプ本数カウント")
 
-camera_tab, upload_tab = st.tabs([
-    "📷 カメラで撮影",
-    "📁 画像をアップロード"
-])
-
-with camera_tab:
-    camera_image = st.camera_input(
-        "パイプの写真を撮影してください",
+    camera_file = st.camera_input(
+        "📷 カメラで撮影",
         key="camera_input"
     )
 
-with upload_tab:
-    uploaded_image = st.file_uploader(
-        "画像ファイルを選択してください",
+    uploaded_file = st.file_uploader(
+        "または画像をアップロード",
         type=["jpg", "jpeg", "png"],
-        key="file_input"
+        key="image_upload"
     )
 
+    selected_file = camera_file if camera_file is not None else uploaded_file
 
-input_image = uploaded_image if uploaded_image is not None else camera_image
+    if selected_file is not None:
+        file_bytes = selected_file.getvalue()
+        current_hash = hashlib.sha256(file_bytes).hexdigest()
 
-if input_image is not None:
-    image_bytes = input_image.getvalue()
-    current_hash = hashlib.sha256(image_bytes).hexdigest()
+        if current_hash != st.session_state.source_hash:
+            st.session_state.source_hash = current_hash
+            st.session_state.original_image = Image.open(
+                io.BytesIO(file_bytes)
+            ).convert("RGB")
+            st.session_state.cropped_image = None
+            reset_detection()
+            st.session_state.phase = "crop"
 
-    if current_hash != st.session_state.source_hash:
-        image = Image.open(io.BytesIO(image_bytes))
-        image = ImageOps.exif_transpose(image)
-        image = resize_image(image)
+            st.rerun()
 
-        st.session_state.source_hash = current_hash
-        st.session_state.source_image = image.copy()
-        st.session_state.work_image = image.copy()
+elif st.session_state.phase == "crop":
 
-        reset_detection()
+    st.subheader("✂️ 検出エリアの調整")
+    st.caption("画像の四隅を動かして、数えたい範囲を選択してください。")
 
+    original = resize_image(st.session_state.original_image)
 
-if st.session_state.source_image is not None:
+    cropped = st_cropper(
+        original,
+        realtime_update=True,
+        box_color="#FFD700",
+        aspect_ratio=None,
+        return_type="image",
+        should_resize_image=True
+    )
 
-    st.divider()
-    st.header("2. 検出範囲の調整")
+    st.caption("選択した範囲だけをAIで検出します。")
 
-    with st.expander("トリミングを行う", expanded=True):
+    col1, col2 = st.columns(2)
 
-        crop_candidate = st_cropper(
-            st.session_state.source_image,
-            realtime_update=False,
-            box_color="#FFFF00",
-            aspect_ratio=None,
-            return_type="image"
-        )
+    with col1:
+        if st.button("🔄 元画像に戻す"):
+            st.session_state.phase = "upload"
+            st.session_state.source_hash = None
+            st.rerun()
 
-        if st.button(
-            "トリミング範囲を確定",
-            use_container_width=True
-        ):
-
-            if crop_candidate is not None:
-                st.session_state.work_image = crop_candidate.convert("RGB")
-                reset_detection()
-
-                st.success("トリミングを確定しました。")
+    with col2:
+        if st.button("🚀 検出開始", type="primary"):
+            if cropped is not None and cropped.size[0] > 0:
+                start_detection(cropped)
                 st.rerun()
 
+elif st.session_state.phase == "result":
 
-    st.subheader("検出に使用する画像")
+    st.subheader("📊 検出結果")
+
+    auto_count = len(st.session_state.auto_boxes)
+    manual_count = len(st.session_state.manual_points)
+    total_count = auto_count + manual_count
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.metric("合計本数", f"{total_count} 本")
+
+    with col2:
+        st.metric("AI自動検出", f"{auto_count} 本")
+
+    st.caption(
+        f"手動追加：{manual_count} 本　"
+        f"手動削減：{st.session_state.deleted_auto_count} 本"
+    )
+
+    result_image = draw_result_image(
+        st.session_state.cropped_image
+    )
 
     st.image(
-        st.session_state.work_image,
+        result_image,
+        caption="黄色：AI検出 / 青色：手動追加",
         use_container_width=True
     )
 
-    st.divider()
-    st.header("3. AIによるパイプ検出")
+    st.markdown("**検出位置の修正**")
 
-    model_path = find_model_path()
-
-    if model_path is None:
-        st.error(
-            "AIモデルが見つかりません。"
-            "モデルファイルをGitHubにアップロードしてください。"
-        )
-
-    else:
-        st.caption(f"使用モデル：{model_path}")
-
-        confidence = st.slider(
-            "検出信頼度",
-            min_value=0.05,
-            max_value=0.95,
-            value=0.25,
-            step=0.05
-        )
-
-        if st.button(
-            "🔍 パイプ検出開始",
-            type="primary",
-            use_container_width=True
-        ):
-
-            try:
-                with st.spinner("AIがパイプを検出しています..."):
-
-                    model = load_model(str(model_path))
-
-                    markers = run_detection(
-                        st.session_state.work_image,
-                        model,
-                        confidence
-                    )
-
-                    st.session_state.markers = markers
-                    st.session_state.automatic_count = len(markers)
-                    st.session_state.manual_added = 0
-                    st.session_state.manual_deleted = 0
-                    st.session_state.detected = True
-                    st.session_state.click_version += 1
-
-                st.success("パイプの検出が完了しました。")
-
-            except Exception as error:
-                st.error(f"検出中にエラーが発生しました：{error}")
-
-
-if st.session_state.detected:
-
-    st.divider()
-    st.header("4. 検出結果の確認と補正")
-
-    total_count = len(st.session_state.markers)
-
-    col1, col2, col3 = st.columns(3)
-
-    col1.metric(
-        "自動検出本数",
-        st.session_state.automatic_count
-    )
-
-    col2.metric(
-        "手動追加本数",
-        st.session_state.manual_added
-    )
-
-    col3.metric(
-        "現在の合計本数",
-        total_count
-    )
-
-    st.write(
-        f"手動削除本数：{st.session_state.manual_deleted} 本"
-    )
-
-    st.divider()
-
-    st.subheader("検出マーカーの補正")
-
-    st.session_state.edit_mode = st.radio(
-        "補正方法を選択してください",
-        ["追加", "削除"],
+    mode = st.radio(
+        "操作方法",
+        ["📍 追加", "🧽 削除"],
         horizontal=True,
-        key="edit_mode_radio"
+        label_visibility="collapsed",
+        key="edit_mode"
     )
 
-    if st.session_state.edit_mode == "追加":
-        st.info("検出できなかったパイプの中心を画像上でクリックしてください。")
+    st.caption("追加：パイプの中心をタップ / 削除：マーカーをタップ")
 
-    else:
-        st.info("削除したい黄色のマーカー付近を画像上でクリックしてください。")
-
-    marked_image = draw_markers(
-        st.session_state.work_image,
-        st.session_state.markers
+    click_image = streamlit_image_coordinates(
+        result_image,
+        key="manual_fix",
+        width=result_image.width
     )
 
-    original_width, original_height = marked_image.size
-
-    display_width = min(
-        original_width,
-        MAX_DISPLAY_WIDTH
-    )
-
-    display_height = int(
-        original_height * display_width / original_width
-    )
-
-    display_image = marked_image.resize(
-        (display_width, display_height),
-        Image.Resampling.LANCZOS
-    )
-
-    coords = streamlit_image_coordinates(
-        display_image,
-        key=f"image_click_{st.session_state.click_version}"
-    )
-
-    if coords is not None:
-        handle_image_click(
-            coords,
-            display_width,
-            display_height
+    if click_image:
+        current_click = (
+            int(click_image["x"]),
+            int(click_image["y"])
         )
 
-        st.session_state.click_version += 1
-        st.rerun()
+        if current_click != st.session_state.last_click:
+            st.session_state.last_click = current_click
+
+            if "追加" in mode:
+                st.session_state.manual_points.append(current_click)
+            else:
+                remove_nearest_point(
+                    current_click[0],
+                    current_click[1]
+                )
+
+            st.rerun()
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button("↩️ 手動追加を全消去"):
+            st.session_state.manual_points = []
+            st.session_state.last_click = None
+            st.rerun()
+
+    with col2:
+        if st.button("🔄 最初からやり直す"):
+            reset_detection()
+            st.session_state.phase = "upload"
+            st.session_state.source_hash = None
+            st.rerun()
 
     st.divider()
 
-    st.subheader("補正後の検出結果")
+    st.subheader("💾 結果の保存")
 
-    final_image = draw_markers(
-        st.session_state.work_image,
-        st.session_state.markers
-    )
+    col1, col2 = st.columns(2)
 
-    st.image(
-        final_image,
-        use_container_width=True
-    )
+    with col1:
+        st.session_state.group_name = st.selectbox(
+            "グループ",
+            ["A", "B", "C", "D"],
+            key="group_select"
+        )
 
-    st.metric(
-        "最終的なパイプ本数",
-        len(st.session_state.markers)
-    )
+    with col2:
+        st.session_state.comment = st.text_input(
+            "備考",
+            value=st.session_state.comment,
+            key="comment_input"
+        )
 
-    if st.button(
-        "検出結果をリセット",
-        use_container_width=True
-    ):
-        reset_detection()
-        st.rerun()
-
-
-    st.divider()
-    st.header("5. 検出結果の保存")
-
-    group_name = st.text_input(
-        "グループ名",
-        placeholder="例：Aグループ"
-    )
-
-    comment = st.text_area(
-        "コメント",
-        placeholder="必要に応じて入力してください"
-    )
-
-    if st.button(
-        "この検出結果を保存データに追加",
-        use_container_width=True
-    ):
-
-        now = datetime.now()
-
-        record_data = {
-            "日時": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "グループ": group_name,
-            "自動検出本数": st.session_state.automatic_count,
-            "手動追加本数": st.session_state.manual_added,
-            "手動削減本数": st.session_state.manual_deleted,
-            "合計本数": len(st.session_state.markers),
-            "コメント": comment
-        }
-
-        record_image = image_to_png_bytes(final_image)
-
-        st.session_state.saved_records.append({
-            "data": record_data,
-            "image": record_image
-        })
-
-        st.success("保存データに追加しました。")
-
-
-st.divider()
-st.header("6. 保存データのダウンロード")
-
-if st.session_state.saved_records:
-
-    st.write(
-        f"保存済みデータ：{len(st.session_state.saved_records)} 件"
-    )
-
-    zip_data = create_zip_bytes(
-        st.session_state.saved_records
-    )
+    zip_data = create_zip()
 
     st.download_button(
-        label="📦 CSV・PNGをZIPでダウンロード",
+        label="⬇️ 判定結果をZIPで保存",
         data=zip_data,
-        file_name="PINEAPPLE_results.zip",
+        file_name=f"pipe_report_{st.session_state.result_timestamp}.zip",
         mime="application/zip",
+        type="primary",
         use_container_width=True
     )
-
-    with st.expander("保存データの一覧"):
-
-        for index, record in enumerate(
-            st.session_state.saved_records,
-            start=1
-        ):
-
-            st.write(
-                f"{index}. "
-                f"{record['data']['日時']} / "
-                f"{record['data']['グループ']} / "
-                f"{record['data']['合計本数']}本"
-            )
-
-else:
-    st.info("まだ保存されたデータはありません。")
