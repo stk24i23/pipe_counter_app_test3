@@ -7,3 +7,4 @@ streamlit-cropper
 streamlit-image-coordinates
 openvino
 opencv-python-headless
+streamlit-cropper
