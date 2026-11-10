@@ -6,3 +6,4 @@ numpy
 streamlit-cropper
 streamlit-image-coordinates
 openvino
+opencv-python-headless
